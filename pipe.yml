@@ -1,0 +1,211 @@
+# ═══════════════════════════════════════════════════════════════
+#  CLASS WALL PIPELINE — all actions in one file
+#
+#   Pull request opened ──▶ 👋 greet      (welcome comment to the student)
+#   Any push / PR        ──▶ ✅ check      (validate the JSON)          = CI
+#   Merge into main      ──▶ 📦 build ─▶ 🚀 deploy ─▶ 📣 notify          = CD
+#
+#  Each job has an "if:" that decides WHEN it runs.
+#
+#  Management alerts — set once in Settings → Secrets and variables → Actions:
+#    Variables tab: MANAGERS = @principal-username @hod-username
+#    Secrets tab (optional): SLACK_WEBHOOK_URL = https://hooks.slack.com/...
+# ═══════════════════════════════════════════════════════════════
+name: Class Wall pipeline
+
+on:
+  pull_request_target:        # used ONLY by "greet" (works for forks too)
+    types: [opened]
+  pull_request:               # used by "check"
+    branches: [main]
+  push:                       # "check" on every branch; build/deploy/notify on main
+  workflow_dispatch:          # "Run workflow" button in the Actions tab
+
+# Default: read-only. Jobs that need more ask for it themselves.
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1) 👋 GREET THE CONTRIBUTOR
+  # Safe with pull_request_target because we never check out the student's code.
+  # ─────────────────────────────────────────────
+  greet:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Post a welcome comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner, repo: context.repo.repo, state: "all", per_page: 100,
+            });
+            const isFirst = prs.filter(p => p.user.login === author).length <= 1;
+
+            const body = [
+              `👋 Hi @${author}, ${isFirst ? "welcome to your **first** pull request here! 🎉" : "thanks for another pull request!"}`,
+              "",
+              "Here's what happens next:",
+              "1. 🤖 **check** validates your JSON file (look for ✅ or ❌ at the bottom of this page).",
+              "2. ❌ Red? Click **Details**, read the error, fix it, then commit and push again.",
+              "3. ✅ Green? Your teacher will review and merge.",
+              "4. 🚀 After the merge, the site deploys automatically and your card goes live!",
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body,
+            });
+
+  # ─────────────────────────────────────────────
+  # 2) ✅ VALIDATE THE JSON  (CI)
+  # Runs on every push and every pull request — never on the greeting event.
+  # ─────────────────────────────────────────────
+  check:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate every students/*.json file
+        run: node build.js --check
+
+      - name: Write a summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## ✅ All student files are valid" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ Some student files have problems" >> "$GITHUB_STEP_SUMMARY"
+            echo "Open the **Validate every students/*.json file** step to see which file and why." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ─────────────────────────────────────────────
+  # 3a) 📦 BUILD THE WEBSITE  (CD — only on main, only if check passed)
+  # ─────────────────────────────────────────────
+  build:
+    needs: check
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build the website into dist/
+        run: node build.js
+
+      - name: Package the website
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  # ─────────────────────────────────────────────
+  # 3b) 🚀 DEPLOY TO GITHUB PAGES
+  # ─────────────────────────────────────────────
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:              # two merges at once → only the newest deploy finishes
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # ─────────────────────────────────────────────
+  # 3c) 📣 ALERT MANAGEMENT  (on success AND on failure)
+  # ─────────────────────────────────────────────
+  notify:
+    needs: [check, build, deploy]
+    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Post to the "Deployment log" issue (mentions notify management)
+        uses: actions/github-script@v7
+        env:
+          MANAGERS: ${{ vars.MANAGERS }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          SITE_URL: ${{ needs.deploy.outputs.url }}
+        with:
+          script: |
+            const ok = process.env.DEPLOY_RESULT === "success";
+            const managers = process.env.MANAGERS || `@${context.repo.owner}`;
+            const sha = context.sha.slice(0, 7);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const commitMsg = (context.payload.head_commit?.message || "manual run").split("\n")[0];
+
+            const body = [
+              ok ? "## 🚀 Deployment succeeded" : "## ❌ Deployment FAILED",
+              "",
+              `${managers} - a new version of the class wall ${ok ? "is live" : "could not be deployed"}.`,
+              "",
+              "| | |",
+              "|---|---|",
+              `| **Change** | ${commitMsg} |`,
+              `| **Commit** | \`${sha}\` |`,
+              `| **By** | @${context.actor} |`,
+              ok ? `| **Site** | ${process.env.SITE_URL} |` : `| **Logs** | ${runUrl} |`,
+            ].join("\n");
+
+            const title = "🚀 Deployment log";
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: "open", per_page: 100,
+            });
+            let issue = issues.find(i => i.title === title && !i.pull_request);
+            if (!issue) {
+              ({ data: issue } = await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo, title,
+                body: "Every deployment of the class wall is reported here automatically.",
+              }));
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number, body,
+            });
+            core.summary.addRaw(body).write();
+
+      - name: Send a Slack message (only if SLACK_WEBHOOK_URL is set)
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          SITE_URL: ${{ needs.deploy.outputs.url }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No SLACK_WEBHOOK_URL secret set - skipping Slack."
+            exit 0
+          fi
+          if [ "$DEPLOY_RESULT" = "success" ]; then
+            TEXT="🚀 Class wall deployed by ${GITHUB_ACTOR} (commit ${GITHUB_SHA::7}): ${SITE_URL}"
+          else
+            TEXT="❌ Class wall deploy FAILED (commit ${GITHUB_SHA::7}): ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            "$SLACK_WEBHOOK_URL"
