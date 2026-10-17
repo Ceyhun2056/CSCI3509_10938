@@ -1,9 +1,8 @@
 name: Deploy site
 
 on: 
-  workflow_run:
-    workflows: "Hello"
-    types: completed
+  push:
+    branches: [main]
 
 
 permissions:
